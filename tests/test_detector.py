@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 
+import networkx as nx
 import numpy as np
 
 from detector import (
@@ -10,6 +11,8 @@ from detector import (
     combined_score,
     cosine_similarity,
     hash_similarity,
+    is_link_match,
+    is_search_match,
     phash_distance,
 )
 
@@ -33,16 +36,26 @@ class ScoreTests(unittest.TestCase):
         high_hash = combined_score(0.50, 0)
         self.assertGreater(high_clip, high_hash)
 
+    def test_phash_distance_is_plain_int(self):
+        dist = phash_distance("ffffffffffffffff", "ffffffffffffffff")
+        self.assertIsInstance(dist, int)
+        self.assertNotIsInstance(dist, np.integer)
+        self.assertEqual(dist, 0)
 
-class TraceTests(unittest.TestCase):
+    def test_search_is_looser_than_link(self):
+        self.assertTrue(is_search_match(0.86, 10))
+        self.assertFalse(is_link_match(0.86, 10))
+        self.assertTrue(is_link_match(0.95, 2))
+        self.assertTrue(is_link_match(0.92, 0))
+
+
+class GraphFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.detector = ImageSourceDetector(
-            db_path=os.path.join(self.tmp.name, "net.pkl"),
-            images_dir=os.path.join(self.tmp.name, "images"),
-        )
+        self.detector = ImageSourceDetector(data_dir=self.tmp.name)
         self.detector.add_user("bob", user_id="U_bob")
         self.detector.add_user("alice", user_id="U_alice")
+        self.detector.add_user("carol", user_id="U_carol")
         self.detector.follow("U_alice", "U_bob")
 
         original = np.array([1.0, 0.0, 0.0], dtype=np.float32)
@@ -54,8 +67,7 @@ class TraceTests(unittest.TestCase):
 
         self._add_fake_post("P_orig", "U_bob", original, shared_hash, earlier)
         self._add_fake_post("P_repost", "U_alice", near, shared_hash, later)
-        self._add_fake_post("P_other", "U_alice", other, "0000000000000000", later)
-        self.detector.graph.add_edge("P_repost", "P_orig", type="reposted_from")
+        self._add_fake_post("P_other", "U_carol", other, "0000000000000000", later)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -73,30 +85,87 @@ class TraceTests(unittest.TestCase):
         self.detector.embeddings[post_id] = embedding
         self.detector.hashes[post_id] = img_hash
 
-    def test_phash_distance_zero_for_same_hash(self):
-        self.assertEqual(phash_distance("ffffffffffffffff", "ffffffffffffffff"), 0)
 
+class TraceTests(GraphFixture):
     def test_similar_search_finds_repost_and_skips_unrelated(self):
-        matches = self.detector.find_similar(post_id="P_repost", clip_threshold=0.90, phash_threshold=5)
+        matches = self.detector.find_similar(post_id="P_repost", clip_threshold=0.85, phash_threshold=5)
         ids = [m.post_id for m in matches]
         self.assertIn("P_orig", ids)
         self.assertNotIn("P_other", ids)
 
     def test_trace_walks_repost_edge_to_original_poster(self):
+        self.detector.graph.add_edge("P_repost", "P_orig", type="reposted_from")
         result = self.detector.trace_source(post_id="P_repost")
         self.assertIsNotNone(result.origin)
         self.assertEqual(result.origin.post_id, "P_orig")
         self.assertEqual(result.origin.username, "bob")
         self.assertEqual(result.path, ["P_orig", "P_repost"])
+        self.assertFalse(result.used_edge_fallback)
+
+    def test_trace_falls_back_to_earliest_match_without_repost_edge(self):
+        result = self.detector.trace_source(post_id="P_repost")
+        self.assertEqual(result.origin.post_id, "P_orig")
+        self.assertEqual(result.origin.username, "bob")
+        self.assertTrue(result.used_edge_fallback)
+        self.assertEqual(result.path[0], "P_orig")
 
     def test_original_post_is_its_own_source(self):
         result = self.detector.trace_source(post_id="P_orig")
         self.assertEqual(result.origin.post_id, "P_orig")
         self.assertEqual(result.path, ["P_orig"])
 
-    def test_centrality_falls_back_to_follow_pagerank(self):
-        source = self.detector.find_source_by_centrality(["P_orig", "P_repost"])
-        self.assertEqual(source, "U_bob")
+    def test_origin_prefers_earliest_match_over_pagerank(self):
+        self.detector.follow("U_carol", "U_alice")
+        result = self.detector.trace_source(post_id="P_repost")
+        amplifier = self.detector.find_source_by_centrality(["P_orig", "P_repost"])
+        self.assertEqual(amplifier, "U_bob")
+        self.assertEqual(result.origin.post_id, "P_orig")
+        self.assertEqual(result.centrality_username, "bob")
+
+        later_viral = np.array([0.97, 0.03, 0.0], dtype=np.float32)
+        self._add_fake_post(
+            "P_viral",
+            "U_alice",
+            later_viral,
+            "ffffffffffffffff",
+            datetime.now(),
+        )
+        self.assertEqual(self.detector.find_source_by_centrality(["P_orig", "P_viral"]), "U_bob")
+        origin = self.detector.trace_source(post_id="P_viral").origin
+        self.assertEqual(origin.post_id, "P_orig")
+
+    def test_author_can_like_own_post_without_losing_posted_edge(self):
+        self.assertIsInstance(self.detector.graph, nx.MultiDiGraph)
+        likes = self.detector.like("U_bob", "P_orig")
+        self.assertEqual(likes, 1)
+        self.assertEqual(self.detector.post_author("P_orig"), "U_bob")
+        self.assertTrue(self.detector._has_typed_edge("U_bob", "P_orig", "posted"))
+        self.assertTrue(self.detector._has_typed_edge("U_bob", "P_orig", "likes"))
+
+
+class PersistenceTests(GraphFixture):
+    def test_json_and_npy_roundtrip(self):
+        self.detector.save()
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp.name, "graph.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp.name, "hashes.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp.name, "embeddings", "P_orig.npy")))
+
+        reloaded = ImageSourceDetector(data_dir=self.tmp.name)
+        self.assertIn("U_bob", reloaded.graph)
+        self.assertIn("P_orig", reloaded.embeddings)
+        self.assertEqual(reloaded.hashes["P_orig"], "ffffffffffffffff")
+        self.assertEqual(reloaded.post_author("P_orig"), "U_bob")
+        np.testing.assert_allclose(reloaded.embeddings["P_orig"], self.detector.embeddings["P_orig"])
+
+
+class SampleImageTests(unittest.TestCase):
+    def test_sample_images_are_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            detector = ImageSourceDetector(data_dir=tmp)
+            paths = detector.create_sample_images()
+            self.assertTrue(os.path.isfile(paths["original"]))
+            self.assertTrue(os.path.isfile(paths["near"]))
+            self.assertTrue(os.path.isfile(paths["other"]))
 
 
 if __name__ == "__main__":

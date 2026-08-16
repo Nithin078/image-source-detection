@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import threading
 import tkinter as tk
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Callable, Optional
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -24,13 +25,16 @@ class ImageSourceApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1280x840")
-        self.root.minsize(980, 680)
+        self.root.geometry("1280x860")
+        self.root.minsize(980, 700)
 
         self.detector = ImageSourceDetector()
         self.status = tk.StringVar(value="Loading CLIP (ViT-B/32)...")
         self.photo_cache = []
         self.graph_canvas: Optional[FigureCanvasTkAgg] = None
+        self._working = False
+        self.last_query_path = None
+        self.last_query_post = None
 
         self._build()
         self._set_busy(True)
@@ -39,12 +43,15 @@ class ImageSourceApp:
     def _build(self) -> None:
         header = ttk.Frame(self.root, padding=(12, 10, 12, 4))
         header.pack(fill="x")
-        ttk.Label(header, text=APP_TITLE, font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        titles = ttk.Frame(header)
+        titles.pack(side="left", fill="x", expand=True)
+        ttk.Label(titles, text=APP_TITLE, font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
-            header,
+            titles,
             text="CLIP embeddings + pHash near-duplicates + NetworkX social graph",
             font=("Segoe UI", 10),
         ).pack(anchor="w")
+        ttk.Button(header, text="Load sample network", command=self._load_sample).pack(side="right", padx=(8, 0))
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=6)
@@ -110,6 +117,12 @@ class ImageSourceApp:
         ttk.Label(form, text="Caption").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         self.caption_entry = ttk.Entry(form, width=70)
         self.caption_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=4, pady=4)
+        ttk.Label(form, text="Timestamp").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        self.timestamp_entry = ttk.Entry(form, width=28)
+        self.timestamp_entry.grid(row=2, column=1, padx=4, pady=4, sticky="w")
+        ttk.Label(form, text="Optional: YYYY-MM-DD HH:MM:SS (blank = now)").grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=4, pady=4
+        )
         ttk.Button(form, text="Add post", command=self._add_post).grid(row=1, column=4, padx=4)
 
         table = ttk.Frame(frame)
@@ -182,12 +195,12 @@ class ImageSourceApp:
         ttk.Button(controls, text="Trace selected post", command=self._trace_post).grid(row=0, column=2, padx=6)
         ttk.Button(controls, text="Trace uploaded image", command=self._trace_upload).grid(row=0, column=3, padx=6)
 
-        ttk.Label(controls, text="CLIP threshold").grid(row=1, column=0, padx=4, pady=4, sticky="w")
-        self.clip_threshold = tk.DoubleVar(value=0.90)
+        ttk.Label(controls, text="CLIP retrieve threshold").grid(row=1, column=0, padx=4, pady=4, sticky="w")
+        self.clip_threshold = tk.DoubleVar(value=0.85)
         ttk.Scale(controls, from_=0.50, to=0.99, variable=self.clip_threshold, orient="horizontal", length=220).grid(
             row=1, column=1, padx=4, pady=4, sticky="ew"
         )
-        self.clip_label = ttk.Label(controls, text="0.90")
+        self.clip_label = ttk.Label(controls, text="0.85")
         self.clip_label.grid(row=1, column=2, sticky="w")
         self.clip_threshold.trace_add("write", lambda *_: self.clip_label.config(text=f"{self.clip_threshold.get():.2f}"))
 
@@ -195,7 +208,7 @@ class ImageSourceApp:
         self.phash_threshold = tk.IntVar(value=5)
         ttk.Spinbox(controls, from_=0, to=20, textvariable=self.phash_threshold, width=6).grid(row=1, column=4, padx=4)
 
-        self.reason_var = tk.StringVar(value="Add users and posts, then trace a post or upload a query image.")
+        self.reason_var = tk.StringVar(value="Add users and posts, or load the sample network, then trace a post.")
         ttk.Label(frame, textvariable=self.reason_var, wraplength=1180, justify="left").pack(anchor="w", pady=(8, 6))
 
         body = ttk.Panedwindow(frame, orient="horizontal")
@@ -242,7 +255,7 @@ class ImageSourceApp:
     def _load_model(self) -> None:
         try:
             self.detector.load_clip()
-            self.root.after(0, lambda: self._ready("CLIP ready. Add users and posts to build the network."))
+            self.root.after(0, lambda: self._ready("CLIP ready. Add users and posts, or load the sample network."))
         except Exception as exc:
             self.root.after(0, lambda: self._ready(f"CLIP failed to load: {exc}"))
 
@@ -252,6 +265,7 @@ class ImageSourceApp:
         self.refresh()
 
     def _set_busy(self, busy: bool) -> None:
+        self._working = busy
         cursor = "watch" if busy else ""
         self.root.config(cursor=cursor)
         for child in self.root.winfo_children():
@@ -259,6 +273,32 @@ class ImageSourceApp:
                 child.configure(cursor=cursor)
             except tk.TclError:
                 pass
+
+    def _run_bg(self, work: Callable, on_ok: Callable, busy_msg: str) -> None:
+        if self._working:
+            messagebox.showinfo("Busy", "Wait for the current CLIP job to finish.")
+            return
+        self._set_busy(True)
+        self.status.set(busy_msg)
+
+        def runner() -> None:
+            try:
+                result = work()
+            except Exception as exc:
+                self.root.after(0, lambda err=exc: self._bg_fail(err))
+                return
+            self.root.after(0, lambda: self._bg_ok(on_ok, result))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _bg_ok(self, on_ok: Callable, result) -> None:
+        self._set_busy(False)
+        on_ok(result)
+
+    def _bg_fail(self, exc: Exception) -> None:
+        self._set_busy(False)
+        self.status.set(str(exc))
+        messagebox.showerror("Task failed", str(exc))
 
     def _combo_id(self, value: str) -> str:
         if " | " in value:
@@ -279,6 +319,15 @@ class ImageSourceApp:
         if path:
             self.image_path_var.set(path)
 
+    def _parse_timestamp(self) -> Optional[datetime]:
+        raw = self.timestamp_entry.get().strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError("Timestamp must be YYYY-MM-DD HH:MM:SS") from exc
+
     def _add_user(self) -> None:
         try:
             user_id = self.detector.add_user(self.username_entry.get(), self.bio_entry.get())
@@ -296,21 +345,31 @@ class ImageSourceApp:
             return
         user_id = self._combo_id(self.post_user_combo.get())
         image_path = self.image_path_var.get().strip()
+        caption = self.caption_entry.get()
         if not user_id or not image_path:
             messagebox.showerror("Missing input", "Select a user and an image.")
             return
         try:
-            post_id, source_id = self.detector.add_post(user_id, image_path, self.caption_entry.get())
-        except Exception as exc:
-            messagebox.showerror("Could not add post", str(exc))
+            timestamp = self._parse_timestamp()
+        except ValueError as exc:
+            messagebox.showerror("Invalid timestamp", str(exc))
             return
-        self.image_path_var.set("")
-        self.caption_entry.delete(0, tk.END)
-        if source_id:
-            self.status.set(f"Added {post_id} as a near-duplicate / repost of {source_id}")
-        else:
-            self.status.set(f"Added original post {post_id}")
-        self.refresh()
+
+        def work():
+            return self.detector.add_post(user_id, image_path, caption, timestamp=timestamp)
+
+        def done(result):
+            post_id, source_id = result
+            self.image_path_var.set("")
+            self.caption_entry.delete(0, tk.END)
+            self.timestamp_entry.delete(0, tk.END)
+            if source_id:
+                self.status.set(f"Added {post_id} as a near-duplicate / repost of {source_id}")
+            else:
+                self.status.set(f"Added original post {post_id}")
+            self.refresh()
+
+        self._run_bg(work, done, "Encoding image with CLIP...")
 
     def _add_follow(self) -> None:
         follower = self._combo_id(self.follower_combo.get())
@@ -334,6 +393,30 @@ class ImageSourceApp:
         self.status.set(f"{user_id} liked {post_id} ({likes} like(s))")
         self.refresh()
 
+    def _load_sample(self) -> None:
+        if not self.detector.clip_ready:
+            messagebox.showwarning("Please wait", "CLIP is still loading.")
+            return
+        if any(post["caption"].startswith("[sample]") for post in self.detector.posts()):
+            if not messagebox.askyesno("Sample network", "Sample posts already exist. Add another sample set?"):
+                return
+
+        def work():
+            return self.detector.load_sample_network()
+
+        def done(result):
+            posts = result["posts"]
+            linked = result["linked"]
+            extra = f" Alice's copy linked to {linked}." if linked else " Alice's copy was stored without a strict repost edge."
+            self.status.set(
+                f"Sample network ready: Bob {posts['original']}, Alice {posts['near']}, Carol {posts['other']}." + extra
+            )
+            self.refresh()
+            self.notebook.select(4)
+            self._draw_graph()
+
+        self._run_bg(work, done, "Building sample network and encoding images...")
+
     def _trace_post(self) -> None:
         post_id = self._combo_id(self.analysis_post_combo.get())
         if not post_id:
@@ -353,17 +436,23 @@ class ImageSourceApp:
             self._run_trace(image_path=path)
 
     def _run_trace(self, post_id: Optional[str] = None, image_path: Optional[str] = None) -> None:
-        try:
-            result = self.detector.trace_source(
+        clip_cut = self.clip_threshold.get()
+        hash_cut = int(self.phash_threshold.get())
+
+        def work():
+            return self.detector.trace_source(
                 post_id=post_id,
                 image_path=image_path,
-                clip_threshold=self.clip_threshold.get(),
-                phash_threshold=int(self.phash_threshold.get()),
+                clip_threshold=clip_cut,
+                phash_threshold=hash_cut,
             )
-        except Exception as exc:
-            messagebox.showerror("Trace failed", str(exc))
-            return
 
+        def done(result):
+            self._show_trace(result, post_id, image_path)
+
+        self._run_bg(work, done, "Tracing source...")
+
+    def _show_trace(self, result, post_id: Optional[str], image_path: Optional[str]) -> None:
         self.last_query_path = image_path
         self.last_query_post = post_id
         for item in self.results_tree.get_children():
@@ -378,7 +467,7 @@ class ImageSourceApp:
                     f"{origin.post_id} (origin)",
                     origin.username,
                     f"{origin.clip_similarity:.4f}",
-                    origin.phash_distance,
+                    int(origin.phash_distance),
                     f"{origin.combined:.4f}",
                     origin.timestamp.isoformat(sep=" ", timespec="seconds"),
                 ),
@@ -396,7 +485,7 @@ class ImageSourceApp:
                     match.post_id,
                     match.username,
                     f"{match.clip_similarity:.4f}",
-                    match.phash_distance,
+                    int(match.phash_distance),
                     f"{match.combined:.4f}",
                     match.timestamp.isoformat(sep=" ", timespec="seconds"),
                 ),
@@ -408,9 +497,9 @@ class ImageSourceApp:
             self._render_compare(self._query_image_path(), result.origin.image_path, result.origin.post_id)
 
     def _query_image_path(self) -> Optional[str]:
-        if getattr(self, "last_query_path", None):
+        if self.last_query_path:
             return self.last_query_path
-        post_id = getattr(self, "last_query_post", None)
+        post_id = self.last_query_post
         if post_id and post_id in self.detector.graph:
             return self.detector.graph.nodes[post_id].get("image_path")
         return None
@@ -515,8 +604,8 @@ class ImageSourceApp:
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
             return
-        self.status.set(f"Saved {self.detector.db_path}")
-        messagebox.showinfo("Saved", f"Database written to {self.detector.db_path}")
+        self.status.set(f"Saved {self.detector.graph_path}")
+        messagebox.showinfo("Saved", f"Graph written to {self.detector.graph_path}")
 
     def refresh(self) -> None:
         for tree in (self.users_tree, self.posts_tree, self.rel_tree):

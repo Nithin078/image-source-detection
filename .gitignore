@@ -9,9 +9,13 @@ venv/
 *.pkl
 *.pkl.tmp
 *.npy
+data/graph.json
+data/hashes.json
 data/stored_images/*
 !data/stored_images/.gitkeep
-data/embeddings/
+data/embeddings/*
+!data/embeddings/.gitkeep
+data/sample_images/
 .DS_Store
 Thumbs.db
 *.log

@@ -11,17 +11,29 @@ from __future__ import annotations
 import argparse
 from typing import Dict, List, Optional
 
-import dgl
 import numpy as np
 import torch
-from transformers import CLIPModel, CLIPProcessor
 from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
 
 from detector import cosine_similarity
 
 
+def _load_dgl():
+    try:
+        import dgl
+    except Exception as exc:
+        raise ImportError(
+            "DGL is optional and could not be imported. Install a matching "
+            "`pip install dgl` build if you want this backend. The main GUI "
+            "does not need it."
+        ) from exc
+    return dgl
+
+
 class DGLImageGraph:
     def __init__(self, model_id: str = "openai/clip-vit-base-patch32"):
+        dgl = _load_dgl()
         self.user_ids: List[str] = []
         self.usernames: List[str] = []
         self.post_ids: List[str] = []
@@ -36,7 +48,10 @@ class DGLImageGraph:
         )
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = CLIPModel.from_pretrained(model_id).to(device)
-        self.processor = CLIPProcessor.from_pretrained(model_id)
+        try:
+            self.processor = CLIPProcessor.from_pretrained(model_id, use_fast=True)
+        except TypeError:
+            self.processor = CLIPProcessor.from_pretrained(model_id)
         self.device = device
         self.model.eval()
 
@@ -69,7 +84,7 @@ class DGLImageGraph:
     def follow(self, follower_idx: int, followee_idx: int) -> None:
         self.graph.add_edges(follower_idx, followee_idx, etype="follows")
 
-    def trace(self, image_path: str, threshold: float = 0.90) -> Optional[Dict]:
+    def trace(self, image_path: str, threshold: float = 0.85) -> Optional[Dict]:
         query = self.embed(image_path)
         best_idx = -1
         best_sim = -1.0

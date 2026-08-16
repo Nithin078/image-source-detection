@@ -2,7 +2,7 @@
 
 A digital-image forensics prototype that finds the likely original poster of a reposted image.
 
-The system stores visual fingerprints of every uploaded image and models the social network those images move through. When a suspicious or reposted image is submitted, it ranks near-matches and walks repost edges to recover the earliest post and poster.
+The system stores visual fingerprints of every uploaded image and models the social network those images move through. When a suspicious or reposted image is submitted, it ranks near-matches and recovers the earliest strong post and poster.
 
 Built during an IFSCR summer internship. This is the cleaned CLIP + graph prototype, not the earlier SIFT experiment.
 
@@ -10,8 +10,9 @@ Built during an IFSCR summer internship. This is the cleaned CLIP + graph protot
 
 - **CLIP (ViT-B/32)** image embeddings with L2-normalized cosine similarity
 - **pHash** near-duplicate / repost detection (Hamming distance)
-- **NetworkX** social graph: user, post, follows, likes, `reposted_from`
-- Source tracing with a ranked similarity score
+- **NetworkX MultiDiGraph** social graph: user, post, follows, likes, `reposted_from`
+- Source tracing by earliest strong match, then shortest repost path
+- Follow-graph **PageRank as an amplifier hint**, not as the origin
 - Optional **DGL** heterograph backend for the same lookup
 - Tkinter GUI to demo posting, following, liking, and tracing end to end
 
@@ -19,11 +20,10 @@ Built during an IFSCR summer internship. This is the cleaned CLIP + graph protot
 
 1. Fingerprint the query with a CLIP embedding and a perceptual hash.
 2. Rank stored posts by a combined score: `0.7 * cosine + 0.3 * (1 - hamming/64)`.
-3. Keep posts above the CLIP threshold **or** inside the pHash distance cutoff (defaults `0.90` / `5`).
-4. If the query is an existing post, walk `reposted_from` edges back to the origin. Otherwise pick the earliest near-match.
-5. PageRank on the follow subgraph of matching posters is reported as a secondary social signal.
-
-Matches are ranked so the strongest provenance signal is first.
+3. **Retrieve** candidates if CLIP cosine ≥ `0.85` **or** pHash distance ≤ `5`.
+4. **Auto-link** a `reposted_from` edge only if the match is strict: CLIP ≥ `0.90` and pHash ≤ `5`, or combined score ≥ `0.88`.
+5. Pick origin as the earliest strong match. If a repost chain exists, prefer the shortest path on that chain. If the edge was never stored, fall back to the earliest strong near-match anyway.
+6. Report follow-graph PageRank as “likely amplifier,” not as the source.
 
 ## Project layout
 
@@ -32,8 +32,13 @@ image-source-detection/
   app.py              GUI
   detector.py         CLIP + pHash + NetworkX tracer
   dgl_backend.py      optional DGL experiment
-  tests/              scoring and graph-walk tests (no GPU needed)
-  data/               runtime database and stored image copies
+  tests/              scoring, graph-walk, and persistence tests
+  data/               runtime store (gitignored except placeholders)
+    graph.json
+    hashes.json
+    embeddings/*.npy
+    stored_images/
+    sample_images/
 ```
 
 Earlier internship drafts used SIFT + histograms + temporal graphs. That path was dropped. The version in this repo is CLIP + graph.
@@ -62,22 +67,28 @@ python dgl_backend.py path/to/original.jpg path/to/query.jpg
 
 ## Demo flow
 
+Fastest path: click **Load sample network**. That creates Bob (original, 2 hours ago), Alice (crop / blur of Bob’s image, 1 hour ago), and Carol (unrelated), then encodes the images in a background thread.
+
+Manual path:
+
 1. Add two users, for example `alice` and `bob`.
-2. Have `bob` post an original image.
-3. Have `alice` follow `bob`, then post a crop, screenshot, or recompressed copy of the same image.
+2. Have `bob` post an original image. You can backdate it with `YYYY-MM-DD HH:MM:SS`.
+3. Have `alice` follow `bob`, then post a crop, screenshot, or recompressed copy.
 4. Open **Trace source**, select Alice's post (or upload the copy), and run the trace.
 5. The origin should be Bob's earlier post, with CLIP / pHash scores and the repost path.
 6. **Network graph** shows users in blue, posts in green, and dashed red `reposted_from` edges.
 
-The graph and embeddings are saved automatically to `data/image_network.pkl`. Stored copies live in `data/stored_images/`. Both are gitignored.
+Adding a post or tracing an uploaded image runs CLIP off the UI thread so the window stays responsive.
+
+The graph is saved as `data/graph.json`, hashes as `data/hashes.json`, and CLIP vectors as `data/embeddings/*.npy`. Stored copies live in `data/stored_images/`. An old `image_network.pkl` is imported once and rewritten into this format.
 
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest tests.test_detector -v
 ```
 
-These tests cover cosine / pHash scoring and origin walking. They do not download CLIP.
+These tests cover scoring, origin fallback, likes-on-own-post, PageRank-as-amplifier, and JSON/NPY persistence. They do not download CLIP.
 
 ## Resume blurb
 
