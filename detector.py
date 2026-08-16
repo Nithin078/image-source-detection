@@ -24,6 +24,13 @@ import networkx as nx
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+try:
+    from PIL.ExifTags import IFD
+
+    EXIF_IFD = IFD.Exif
+except Exception:
+    EXIF_IFD = 0x8769
+
 CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
 DEFAULT_CLIP_THRESHOLD = 0.85
 DEFAULT_LINK_CLIP_THRESHOLD = 0.90
@@ -44,6 +51,47 @@ def _parse_ts(value) -> datetime:
     if isinstance(value, str):
         return datetime.fromisoformat(value)
     return _now()
+
+
+def parse_exif_datetime(raw: str) -> Optional[datetime]:
+    text = str(raw).strip().split(".")[0]
+    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y:%m:%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def image_timestamp(image_path: str) -> Tuple[datetime, str]:
+    """Prefer EXIF DateTimeOriginal, then file mtime, then now."""
+    try:
+        with Image.open(image_path) as image:
+            exif = image.getexif()
+            if exif:
+                values = []
+                for tag in (36867, 36868, 306):
+                    value = exif.get(tag)
+                    if value:
+                        values.append(value)
+                try:
+                    ifd = exif.get_ifd(EXIF_IFD)
+                    for tag in (36867, 36868, 306):
+                        value = ifd.get(tag)
+                        if value:
+                            values.append(value)
+                except Exception:
+                    pass
+                for raw in values:
+                    parsed = parse_exif_datetime(str(raw))
+                    if parsed:
+                        return parsed, "exif"
+    except Exception:
+        pass
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(image_path)), "mtime"
+    except OSError:
+        return _now(), "now"
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -229,7 +277,10 @@ class ImageSourceDetector:
 
         embedding = self.get_clip_embedding(image_path)
         img_hash = self.get_phash(image_path)
-        ts = timestamp or _now()
+        if timestamp is None:
+            ts, ts_source = image_timestamp(image_path)
+        else:
+            ts, ts_source = timestamp, "manual"
 
         with self._lock:
             if user_id not in self.graph or self.graph.nodes[user_id].get("type") != "user":
@@ -251,6 +302,7 @@ class ImageSourceDetector:
                 original_path=image_path,
                 caption=caption.strip(),
                 timestamp=ts.isoformat(),
+                timestamp_source=ts_source,
                 created_at=ts.isoformat(),
                 likes=0,
             )
@@ -285,6 +337,67 @@ class ImageSourceDetector:
             self.save()
             return likes
 
+    def unfollow(self, follower_id: str, followee_id: str) -> None:
+        with self._lock:
+            if not self._remove_typed_edges(follower_id, followee_id, "follows"):
+                raise ValueError("That follow relationship does not exist")
+            self.save()
+
+    def unlike(self, user_id: str, post_id: str) -> int:
+        with self._lock:
+            self._require_post(post_id)
+            if not self._remove_typed_edges(user_id, post_id, "likes"):
+                raise ValueError("That like does not exist")
+            likes = max(0, int(self.graph.nodes[post_id].get("likes", 0)) - 1)
+            self.graph.nodes[post_id]["likes"] = likes
+            self.save()
+            return likes
+
+    def delete_post(self, post_id: str) -> None:
+        with self._lock:
+            self._require_post(post_id)
+            image_path = self.graph.nodes[post_id].get("image_path")
+            self.graph.remove_node(post_id)
+            self.embeddings.pop(post_id, None)
+            self.hashes.pop(post_id, None)
+            if image_path and os.path.isfile(image_path):
+                try:
+                    os.remove(image_path)
+                except OSError:
+                    pass
+            self.save()
+
+    def delete_user(self, user_id: str) -> int:
+        with self._lock:
+            self._require_user(user_id)
+            post_ids = list(self.user_posts(user_id))
+        for post_id in post_ids:
+            self.delete_post(post_id)
+        with self._lock:
+            if user_id in self.graph:
+                self.graph.remove_node(user_id)
+                self.save()
+        return len(post_ids)
+
+    def reset(self) -> None:
+        with self._lock:
+            self.graph = nx.MultiDiGraph()
+            self.embeddings = {}
+            self.hashes = {}
+            for folder in (self.images_dir, self.emb_dir):
+                if not os.path.isdir(folder):
+                    continue
+                for name in os.listdir(folder):
+                    if name == ".gitkeep":
+                        continue
+                    path = os.path.join(folder, name)
+                    if os.path.isfile(path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+            self.save()
+
     def users(self) -> List[Dict]:
         with self._lock:
             rows = []
@@ -317,6 +430,7 @@ class ImageSourceDetector:
                             "username": username,
                             "caption": data.get("caption", ""),
                             "timestamp": data.get("timestamp", ""),
+                            "timestamp_source": data.get("timestamp_source", ""),
                             "likes": int(data.get("likes", 0)),
                             "image_path": data.get("image_path", ""),
                             "repost_of": self._direct_source(node_id),
@@ -698,6 +812,17 @@ class ImageSourceDetector:
 
     def _has_typed_edge(self, source: str, target: str, etype: str) -> bool:
         return any(edge.get("type") == etype for edge in self._typed_edges_between(source, target))
+
+    def _remove_typed_edges(self, source: str, target: str, etype: str) -> int:
+        data = self.graph.get_edge_data(source, target)
+        if not data:
+            return 0
+        removed = 0
+        for key in list(data.keys()):
+            if data[key].get("type") == etype:
+                self.graph.remove_edge(source, target, key)
+                removed += 1
+        return removed
 
     def _out_neighbors(self, source: str, etype: str) -> Iterable[str]:
         for _, target, data in self.graph.out_edges(source, data=True):

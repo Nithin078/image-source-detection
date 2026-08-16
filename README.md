@@ -14,7 +14,9 @@ Built during an IFSCR summer internship. This is the cleaned CLIP + graph protot
 - Source tracing by earliest strong match, then shortest repost path
 - Follow-graph **PageRank as an amplifier hint**, not as the origin
 - Optional **DGL** heterograph backend for the same lookup
-- Tkinter GUI to demo posting, following, liking, and tracing end to end
+- Tkinter GUI to demo posting, following, liking, tracing, deleting, and reset
+- Blank post timestamps use **EXIF DateTimeOriginal**, then file time
+- After a trace, the network graph highlights the origin path
 
 ## How source tracing works
 
@@ -76,7 +78,9 @@ Manual path:
 3. Have `alice` follow `bob`, then post a crop, screenshot, or recompressed copy.
 4. Open **Trace source**, select Alice's post (or upload the copy), and run the trace.
 5. The origin should be Bob's earlier post, with CLIP / pHash scores and the repost path.
-6. **Network graph** shows users in blue, posts in green, and dashed red `reposted_from` edges.
+6. **Network graph** updates after every change. After a trace, gold is the origin, orange is the path, and red is the query post.
+
+If you leave the timestamp blank, the post uses the photo's EXIF date, or the file time if EXIF is missing. Use **Delete selected** / **Unfollow** / **Unlike** to edit the graph, or **Reset database** to wipe the store without deleting the repo.
 
 Adding a post or tracing an uploaded image runs CLIP off the UI thread so the window stays responsive.
 

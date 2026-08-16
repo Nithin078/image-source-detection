@@ -35,6 +35,9 @@ class ImageSourceApp:
         self._working = False
         self.last_query_path = None
         self.last_query_post = None
+        self.trace_path = []
+        self.trace_origin = None
+        self.trace_query = None
 
         self._build()
         self._set_busy(True)
@@ -51,6 +54,7 @@ class ImageSourceApp:
             text="CLIP embeddings + pHash near-duplicates + NetworkX social graph",
             font=("Segoe UI", 10),
         ).pack(anchor="w")
+        ttk.Button(header, text="Reset database", command=self._reset_database).pack(side="right", padx=(8, 0))
         ttk.Button(header, text="Load sample network", command=self._load_sample).pack(side="right", padx=(8, 0))
 
         self.notebook = ttk.Notebook(self.root)
@@ -80,6 +84,7 @@ class ImageSourceApp:
         self.bio_entry = ttk.Entry(form, width=40)
         self.bio_entry.grid(row=0, column=3, padx=4, pady=4)
         ttk.Button(form, text="Add user", command=self._add_user).grid(row=0, column=4, padx=8)
+        ttk.Button(form, text="Delete selected user", command=self._delete_user).grid(row=0, column=5, padx=8)
 
         table = ttk.Frame(frame)
         table.pack(fill="both", expand=True, pady=(10, 0))
@@ -120,10 +125,11 @@ class ImageSourceApp:
         ttk.Label(form, text="Timestamp").grid(row=2, column=0, sticky="w", padx=4, pady=4)
         self.timestamp_entry = ttk.Entry(form, width=28)
         self.timestamp_entry.grid(row=2, column=1, padx=4, pady=4, sticky="w")
-        ttk.Label(form, text="Optional: YYYY-MM-DD HH:MM:SS (blank = now)").grid(
+        ttk.Label(form, text="Optional: YYYY-MM-DD HH:MM:SS (blank = EXIF, else file time)").grid(
             row=2, column=2, columnspan=2, sticky="w", padx=4, pady=4
         )
         ttk.Button(form, text="Add post", command=self._add_post).grid(row=1, column=4, padx=4)
+        ttk.Button(form, text="Delete selected post", command=self._delete_post).grid(row=2, column=4, padx=4)
 
         table = ttk.Frame(frame)
         table.pack(fill="both", expand=True, pady=(10, 0))
@@ -160,6 +166,7 @@ class ImageSourceApp:
         self.followee_combo = ttk.Combobox(follow, width=28, state="readonly")
         self.followee_combo.grid(row=0, column=3, padx=4, pady=4)
         ttk.Button(follow, text="Add follow", command=self._add_follow).grid(row=0, column=4, padx=8)
+        ttk.Button(follow, text="Unfollow selected", command=self._unfollow).grid(row=0, column=5, padx=8)
 
         like = ttk.LabelFrame(frame, text="Like a post", padding=10)
         like.pack(fill="x", pady=(8, 0))
@@ -170,6 +177,7 @@ class ImageSourceApp:
         self.like_post_combo = ttk.Combobox(like, width=28, state="readonly")
         self.like_post_combo.grid(row=0, column=3, padx=4, pady=4)
         ttk.Button(like, text="Like", command=self._add_like).grid(row=0, column=4, padx=8)
+        ttk.Button(like, text="Unlike", command=self._unlike).grid(row=0, column=5, padx=8)
 
         table = ttk.LabelFrame(frame, text="Follow edges", padding=10)
         table.pack(fill="both", expand=True, pady=(10, 0))
@@ -247,6 +255,7 @@ class ImageSourceApp:
         controls = ttk.Frame(frame)
         controls.pack(fill="x")
         ttk.Button(controls, text="Refresh graph", command=self._draw_graph).pack(side="left")
+        ttk.Button(controls, text="Clear path highlight", command=self._clear_highlight).pack(side="left", padx=8)
         self.graph_info = ttk.Label(controls, text="")
         self.graph_info.pack(side="left", padx=12)
         self.graph_host = ttk.Frame(frame)
@@ -393,6 +402,95 @@ class ImageSourceApp:
         self.status.set(f"{user_id} liked {post_id} ({likes} like(s))")
         self.refresh()
 
+    def _unlike(self) -> None:
+        user_id = self._combo_id(self.like_user_combo.get())
+        post_id = self._combo_id(self.like_post_combo.get())
+        try:
+            likes = self.detector.unlike(user_id, post_id)
+        except Exception as exc:
+            messagebox.showerror("Could not unlike post", str(exc))
+            return
+        self.status.set(f"{user_id} unliked {post_id} ({likes} like(s))")
+        self.refresh()
+
+    def _delete_user(self) -> None:
+        selection = self.users_tree.selection()
+        if not selection:
+            messagebox.showerror("Missing selection", "Select a user to delete.")
+            return
+        user_id = selection[0]
+        username = self.users_tree.item(selection[0])["values"][1]
+        if not messagebox.askyesno("Delete user", f"Delete {username} and all of their posts?"):
+            return
+        try:
+            removed = self.detector.delete_user(user_id)
+        except Exception as exc:
+            messagebox.showerror("Could not delete user", str(exc))
+            return
+        self._forget_highlight_ids({user_id})
+        self.status.set(f"Deleted user {username} and {removed} post(s)")
+        self.refresh()
+
+    def _delete_post(self) -> None:
+        selection = self.posts_tree.selection()
+        if not selection:
+            messagebox.showerror("Missing selection", "Select a post to delete.")
+            return
+        post_id = selection[0]
+        if not messagebox.askyesno("Delete post", f"Delete post {post_id}?"):
+            return
+        try:
+            self.detector.delete_post(post_id)
+        except Exception as exc:
+            messagebox.showerror("Could not delete post", str(exc))
+            return
+        self._forget_highlight_ids({post_id})
+        self.status.set(f"Deleted post {post_id}")
+        self.refresh()
+
+    def _unfollow(self) -> None:
+        selection = self.rel_tree.selection()
+        if selection:
+            follower_id, followee_id = selection[0].split("\t", 1)
+        else:
+            follower_id = self._combo_id(self.follower_combo.get())
+            followee_id = self._combo_id(self.followee_combo.get())
+        try:
+            self.detector.unfollow(follower_id, followee_id)
+        except Exception as exc:
+            messagebox.showerror("Could not unfollow", str(exc))
+            return
+        self.status.set(f"{follower_id} unfollowed {followee_id}")
+        self.refresh()
+
+    def _reset_database(self) -> None:
+        if not messagebox.askyesno(
+            "Reset database",
+            "Delete every user, post, follow, like, stored image, and embedding?",
+        ):
+            return
+        try:
+            self.detector.reset()
+        except Exception as exc:
+            messagebox.showerror("Reset failed", str(exc))
+            return
+        self._clear_highlight()
+        self.status.set("Database reset.")
+        self.refresh()
+
+    def _clear_highlight(self) -> None:
+        self.trace_path = []
+        self.trace_origin = None
+        self.trace_query = None
+        if hasattr(self, "graph_host"):
+            self._draw_graph()
+
+    def _forget_highlight_ids(self, removed: set) -> None:
+        if self.trace_origin in removed or self.trace_query in removed or removed.intersection(self.trace_path):
+            self.trace_path = []
+            self.trace_origin = None
+            self.trace_query = None
+
     def _load_sample(self) -> None:
         if not self.detector.clip_ready:
             messagebox.showwarning("Please wait", "CLIP is still loading.")
@@ -411,9 +509,9 @@ class ImageSourceApp:
             self.status.set(
                 f"Sample network ready: Bob {posts['original']}, Alice {posts['near']}, Carol {posts['other']}." + extra
             )
+            self._clear_highlight()
             self.refresh()
             self.notebook.select(4)
-            self._draw_graph()
 
         self._run_bg(work, done, "Building sample network and encoding images...")
 
@@ -493,8 +591,12 @@ class ImageSourceApp:
 
         self.reason_var.set(result.reasoning)
         self.status.set(result.reasoning)
+        self.trace_path = list(result.path or [])
+        self.trace_origin = result.origin.post_id if result.origin else None
+        self.trace_query = post_id
         if result.origin:
             self._render_compare(self._query_image_path(), result.origin.image_path, result.origin.post_id)
+        self._draw_graph()
 
     def _query_image_path(self) -> Optional[str]:
         if self.last_query_path:
@@ -559,9 +661,12 @@ class ImageSourceApp:
             label.pack(padx=12, pady=12)
             self.photo_cache.append(photo)
         ttk.Label(win, text=f"Caption: {data.get('caption') or '(none)'}").pack(anchor="w", padx=12)
-        ttk.Label(win, text=f"Timestamp: {data.get('timestamp')}").pack(anchor="w", padx=12, pady=(0, 12))
+        source = data.get("timestamp_source") or "unknown"
+        ttk.Label(win, text=f"Timestamp: {data.get('timestamp')} ({source})").pack(anchor="w", padx=12, pady=(0, 12))
 
     def _draw_graph(self) -> None:
+        if not hasattr(self, "graph_host"):
+            return
         for child in self.graph_host.winfo_children():
             child.destroy()
         fig = Figure(figsize=(11, 7), dpi=100)
@@ -573,29 +678,68 @@ class ImageSourceApp:
             ax.text(0.5, 0.5, "Graph is empty", ha="center", va="center")
         else:
             pos = nx.spring_layout(graph, seed=7, k=0.85)
+            path_set = set(self.trace_path)
+            post_colors = []
+            post_sizes = []
+            for post in posts:
+                if post == self.trace_origin:
+                    post_colors.append("#e9c46a")
+                    post_sizes.append(1200)
+                elif post == self.trace_query:
+                    post_colors.append("#e76f51")
+                    post_sizes.append(1100)
+                elif post in path_set:
+                    post_colors.append("#f4a261")
+                    post_sizes.append(950)
+                else:
+                    post_colors.append("#b7e4c7")
+                    post_sizes.append(780)
             nx.draw_networkx_nodes(graph, pos, nodelist=users, node_color="#8ecae6", node_size=1100, ax=ax)
-            nx.draw_networkx_nodes(graph, pos, nodelist=posts, node_color="#b7e4c7", node_size=780, ax=ax)
+            if posts:
+                nx.draw_networkx_nodes(graph, pos, nodelist=posts, node_color=post_colors, node_size=post_sizes, ax=ax)
             posted = [(u, v) for u, v, d in graph.edges(data=True) if d.get("type") == "posted"]
             follows = [(u, v) for u, v, d in graph.edges(data=True) if d.get("type") == "follows"]
             likes = [(u, v) for u, v, d in graph.edges(data=True) if d.get("type") == "likes"]
             reposts = [(u, v) for u, v, d in graph.edges(data=True) if d.get("type") == "reposted_from"]
+            path_edges = []
+            for older, newer in zip(self.trace_path, self.trace_path[1:]):
+                if self.detector._has_typed_edge(newer, older, "reposted_from"):
+                    path_edges.append((newer, older))
+                elif self.detector._has_typed_edge(older, newer, "reposted_from"):
+                    path_edges.append((older, newer))
             nx.draw_networkx_edges(graph, pos, edgelist=posted, edge_color="#2d6a4f", ax=ax, arrows=True)
             nx.draw_networkx_edges(graph, pos, edgelist=follows, edge_color="#1d3557", ax=ax, arrows=True)
             nx.draw_networkx_edges(graph, pos, edgelist=likes, edge_color="#e76f51", ax=ax, arrows=True, style="dotted")
             nx.draw_networkx_edges(graph, pos, edgelist=reposts, edge_color="#9b2226", ax=ax, arrows=True, style="dashed")
+            if path_edges:
+                nx.draw_networkx_edges(
+                    graph,
+                    pos,
+                    edgelist=path_edges,
+                    edge_color="#e9c46a",
+                    width=3.0,
+                    ax=ax,
+                    arrows=True,
+                )
             labels = {
                 n: d.get("username", n) if d.get("type") == "user" else n
                 for n, d in graph.nodes(data=True)
             }
             nx.draw_networkx_labels(graph, pos, labels=labels, font_size=8, ax=ax)
-        ax.set_title("Users (blue), posts (green). Dashed red = reposted_from")
+        title = "Users (blue), posts (green). Dashed red = reposted_from"
+        if self.trace_origin:
+            title = "Gold = origin, orange = path, red = query. Dashed red = reposted_from"
+        ax.set_title(title)
         ax.axis("off")
         fig.tight_layout()
         canvas = FigureCanvasTkAgg(fig, master=self.graph_host)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
         self.graph_canvas = canvas
-        self.graph_info.config(text=f"{len(users)} users, {len(posts)} posts, {graph.number_of_edges()} edges")
+        extra = ""
+        if self.trace_path:
+            extra = f" | path: {' -> '.join(self.trace_path)}"
+        self.graph_info.config(text=f"{len(users)} users, {len(posts)} posts, {graph.number_of_edges()} edges{extra}")
         plt.close(fig)
 
     def _save(self) -> None:
@@ -616,17 +760,22 @@ class ImageSourceApp:
             self.users_tree.insert(
                 "",
                 "end",
+                iid=user["id"],
                 values=(user["id"], user["username"], user["bio"], user["followers"], user["posts"]),
             )
         for post in self.detector.posts():
+            stamp = post["timestamp"]
+            if post.get("timestamp_source"):
+                stamp = f"{stamp} ({post['timestamp_source']})"
             self.posts_tree.insert(
                 "",
                 "end",
+                iid=post["id"],
                 values=(
                     post["id"],
                     f"{post['username']} ({post['user_id']})",
                     post["caption"],
-                    post["timestamp"],
+                    stamp,
                     post["likes"],
                     post["repost_of"] or "",
                 ),
@@ -635,6 +784,7 @@ class ImageSourceApp:
             self.rel_tree.insert(
                 "",
                 "end",
+                iid=f"{follower_id}\t{followee_id}",
                 values=(f"{follower_name} ({follower_id})", f"{followee_name} ({followee_id})"),
             )
 
@@ -649,6 +799,7 @@ class ImageSourceApp:
             combo["values"] = users
         self.like_post_combo["values"] = posts
         self.analysis_post_combo["values"] = posts
+        self._draw_graph()
 
 
 def main() -> None:

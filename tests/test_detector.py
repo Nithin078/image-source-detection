@@ -11,8 +11,10 @@ from detector import (
     combined_score,
     cosine_similarity,
     hash_similarity,
+    image_timestamp,
     is_link_match,
     is_search_match,
+    parse_exif_datetime,
     phash_distance,
 )
 
@@ -166,6 +168,53 @@ class SampleImageTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(paths["original"]))
             self.assertTrue(os.path.isfile(paths["near"]))
             self.assertTrue(os.path.isfile(paths["other"]))
+
+
+class TimestampTests(unittest.TestCase):
+    def test_parse_exif_datetime(self):
+        parsed = parse_exif_datetime("2024:06:13 11:47:38")
+        self.assertEqual(parsed, datetime(2024, 6, 13, 11, 47, 38))
+        self.assertIsNone(parse_exif_datetime("not-a-date"))
+
+    def test_generated_image_falls_back_to_mtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            detector = ImageSourceDetector(data_dir=tmp)
+            path = detector.create_sample_images()["original"]
+            expected = datetime.fromtimestamp(os.path.getmtime(path))
+            stamp, source = image_timestamp(path)
+            self.assertEqual(source, "mtime")
+            self.assertAlmostEqual(stamp.timestamp(), expected.timestamp(), delta=2)
+
+
+class DeleteResetTests(GraphFixture):
+    def test_delete_post_removes_fingerprint_and_keeps_author(self):
+        self.detector.delete_post("P_other")
+        self.assertNotIn("P_other", self.detector.graph)
+        self.assertNotIn("P_other", self.detector.embeddings)
+        self.assertNotIn("P_other", self.detector.hashes)
+        self.assertIn("U_carol", self.detector.graph)
+
+    def test_delete_user_removes_their_posts(self):
+        removed = self.detector.delete_user("U_alice")
+        self.assertEqual(removed, 1)
+        self.assertNotIn("U_alice", self.detector.graph)
+        self.assertNotIn("P_repost", self.detector.graph)
+        self.assertIn("P_orig", self.detector.graph)
+
+    def test_unfollow_and_unlike(self):
+        self.detector.like("U_bob", "P_orig")
+        self.assertEqual(self.detector.unlike("U_bob", "P_orig"), 0)
+        self.detector.unfollow("U_alice", "U_bob")
+        self.assertEqual(self.detector.follows(), [])
+
+    def test_reset_clears_graph_and_store(self):
+        self.detector.save()
+        self.detector.reset()
+        self.assertEqual(list(self.detector.graph.nodes()), [])
+        self.assertEqual(self.detector.embeddings, {})
+        self.assertEqual(self.detector.hashes, {})
+        reloaded = ImageSourceDetector(data_dir=self.tmp.name)
+        self.assertEqual(list(reloaded.graph.nodes()), [])
 
 
 if __name__ == "__main__":
