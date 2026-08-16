@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.pkl
+*.pkl.tmp
+*.npy
+data/stored_images/*
+!data/stored_images/.gitkeep
+data/embeddings/
+.DS_Store
+Thumbs.db
+*.log
